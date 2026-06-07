@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+@app.get("/")
+async def root():
+    return {"status": "Video Processor is Running"}
+
 # Supabase Setup
 URL = os.environ.get("SUPABASE_URL")
 KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
@@ -65,6 +69,11 @@ def process_video_task(temp_video_path: str, match_id: int, match_name: str, has
                     logger.info("Auto-generated thumbnail uploaded successfully.")
                 else:
                     logger.error(f"FFmpeg thumbnail failed: {result.stderr}")
+
+            # 1b. Update Thumbnail immediately in Database
+            if thumb_url:
+                logger.info(f"Updating DB with thumbnail for Match {match_id} immediately...")
+                supabase.table("matches").update({"thumbnail": thumb_url}).eq("id", match_id).execute()
 
             # 2. Generate HLS Assets (ABR)
             logger.info("Starting HLS conversion (720p & 480p)...")
