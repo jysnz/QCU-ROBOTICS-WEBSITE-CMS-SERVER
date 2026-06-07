@@ -4,3 +4,4 @@ gunicorn
 supabase
 python-dotenv
 requests
+python-multipart
