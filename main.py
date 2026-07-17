@@ -1,6 +1,7 @@
 import os
 import subprocess
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException
 from supabase import create_client, Client
 from tempfile import TemporaryDirectory
@@ -51,37 +52,28 @@ def process_video_task(temp_video_path: str, match_id: int, match_name: str, has
                     )
                 thumb_url = supabase.storage.from_(BUCKET).get_public_url(f"{match_name}/thumbnail.jpg")
             else:
-                logger.info("No manual thumbnail. Generating one from video...")
+                # Auto-generated thumbnail extraction is independent of the HLS
+                # encode below (both only read the source file), so it runs on
+                # a background thread while the HLS conversion proceeds.
+                logger.info("No manual thumbnail. Generating one from video in the background...")
                 thumb_local = os.path.join(temp_dir, "thumbnail.jpg")
-                result = subprocess.run([
-                    'ffmpeg', '-i', input_path, '-ss', '00:00:01.000', 
-                    '-vframes', '1', thumb_local
-                ], capture_output=True, text=True)
-                
-                if result.returncode == 0:
-                    with open(thumb_local, 'rb') as f:
-                        supabase.storage.from_(BUCKET).upload(
-                            path=f"{match_name}/thumbnail.jpg",
-                            file=f,
-                            file_options={"upsert": "true"}
-                        )
-                    thumb_url = supabase.storage.from_(BUCKET).get_public_url(f"{match_name}/thumbnail.jpg")
-                    logger.info("Auto-generated thumbnail uploaded successfully.")
-                else:
-                    logger.error(f"FFmpeg thumbnail failed: {result.stderr}")
 
-            # 1b. Update Thumbnail immediately in Database
-            if thumb_url:
-                logger.info(f"Updating DB with thumbnail for Match {match_id} immediately...")
-                supabase.table("matches").update({"thumbnail": thumb_url}).eq("id", match_id).execute()
+                def generate_thumbnail():
+                    return subprocess.run([
+                        'ffmpeg', '-i', input_path, '-ss', '00:00:01.000',
+                        '-vframes', '1', thumb_local
+                    ], capture_output=True, text=True)
+
+                thumb_executor = ThreadPoolExecutor(max_workers=1)
+                thumb_future = thumb_executor.submit(generate_thumbnail)
 
             # 2. Generate HLS Assets (ABR)
             logger.info("Starting HLS conversion (720p & 480p)...")
             ffmpeg_cmd = [
-                'ffmpeg', '-i', input_path,
+                'ffmpeg', '-threads', '0', '-i', input_path,
                 '-filter_complex', '[0:v]split=2[v1][v2];[v1]scale=w=1280:h=720[v1out];[v2]scale=w=854:h=480[v2out]',
-                '-map', '[v1out]', '-map', '0:a', '-c:v:0', 'libx264', '-b:v:0', '2800k',
-                '-map', '[v2out]', '-map', '0:a', '-c:v:1', 'libx264', '-b:v:1', '1400k',
+                '-map', '[v1out]', '-map', '0:a', '-c:v:0', 'libx264', '-preset', 'veryfast', '-b:v:0', '2800k',
+                '-map', '[v2out]', '-map', '0:a', '-c:v:1', 'libx264', '-preset', 'veryfast', '-b:v:1', '1400k',
                 '-f', 'hls', '-hls_time', '10', '-hls_list_size', '0',
                 '-master_pl_name', 'master.m3u8',
                 '-hls_segment_filename', os.path.join(abr_dir, 'segment_%v_%03d.ts'),
@@ -97,8 +89,30 @@ def process_video_task(temp_video_path: str, match_id: int, match_name: str, has
 
             logger.info("HLS conversion complete. Uploading segments...")
 
-            # 3. Upload ABR files to Supabase
-            for file_name in os.listdir(abr_dir):
+            # Pick up the auto-generated thumbnail once it's ready and upload it.
+            if not has_manual_thumb:
+                thumb_result = thumb_future.result()
+                thumb_executor.shutdown(wait=True)
+
+                if thumb_result.returncode == 0:
+                    with open(thumb_local, 'rb') as f:
+                        supabase.storage.from_(BUCKET).upload(
+                            path=f"{match_name}/thumbnail.jpg",
+                            file=f,
+                            file_options={"upsert": "true"}
+                        )
+                    thumb_url = supabase.storage.from_(BUCKET).get_public_url(f"{match_name}/thumbnail.jpg")
+                    logger.info("Auto-generated thumbnail uploaded successfully.")
+                else:
+                    logger.error(f"FFmpeg thumbnail failed: {thumb_result.stderr}")
+
+            # 1b. Update Thumbnail in Database
+            if thumb_url:
+                logger.info(f"Updating DB with thumbnail for Match {match_id}...")
+                supabase.table("matches").update({"thumbnail": thumb_url}).eq("id", match_id).execute()
+
+            # 3. Upload ABR files to Supabase concurrently
+            def upload_segment(file_name: str):
                 file_path = os.path.join(abr_dir, file_name)
                 with open(file_path, 'rb') as f:
                     supabase.storage.from_(BUCKET).upload(
@@ -106,8 +120,24 @@ def process_video_task(temp_video_path: str, match_id: int, match_name: str, has
                         file=f,
                         file_options={"upsert": "true"}
                     )
-            
-            logger.info(f"All {len(os.listdir(abr_dir))} HLS files uploaded.")
+                return file_name
+
+            abr_files = os.listdir(abr_dir)
+            upload_errors = []
+            with ThreadPoolExecutor(max_workers=8) as upload_executor:
+                futures = {upload_executor.submit(upload_segment, name): name for name in abr_files}
+                for future in as_completed(futures):
+                    file_name = futures[future]
+                    try:
+                        future.result()
+                    except Exception as upload_exc:
+                        logger.error(f"Failed to upload {file_name}: {upload_exc}")
+                        upload_errors.append(file_name)
+
+            if upload_errors:
+                raise Exception(f"Failed to upload {len(upload_errors)} HLS file(s): {upload_errors}")
+
+            logger.info(f"All {len(abr_files)} HLS files uploaded.")
 
             # 4. Update Database
             video_url = supabase.storage.from_(BUCKET).get_public_url(f"{match_name}/abr/master.m3u8")
