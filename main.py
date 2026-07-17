@@ -111,7 +111,7 @@ def process_video_task(temp_video_path: str, match_id: int, match_name: str, has
             # 2. Generate HLS Assets (ABR)
             logger.info("Starting HLS conversion (720p & 480p)...")
             ffmpeg_cmd = [
-                'ffmpeg', '-threads', '0', '-i', input_path,
+                'ffmpeg', '-threads', '2', '-i', input_path,
                 '-filter_complex', '[0:v]split=2[v1][v2];[v1]scale=w=1280:h=720[v1out];[v2]scale=w=854:h=480[v2out]',
                 '-map', '[v1out]', '-map', '0:a', '-c:v:0', 'libx264', '-preset', 'veryfast', '-b:v:0', '2800k',
                 '-map', '[v2out]', '-map', '0:a', '-c:v:1', 'libx264', '-preset', 'veryfast', '-b:v:1', '1400k',

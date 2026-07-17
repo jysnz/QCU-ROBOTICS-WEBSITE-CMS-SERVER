@@ -10,6 +10,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Run Gunicorn with Uvicorn workers for production
-# -w 4: starts 4 worker processes
+# -w 1: a single worker -- video processing is memory-heavy (ffmpeg) and this
+# service doesn't need request concurrency, so more workers just multiply
+# the per-process memory overhead (boto3, supabase, etc.) without benefit.
 # -k uvicorn.workers.UvicornWorker: tells gunicorn to use uvicorn for async support
-CMD gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
+CMD gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
