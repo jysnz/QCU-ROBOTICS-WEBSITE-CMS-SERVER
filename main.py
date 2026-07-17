@@ -4,8 +4,7 @@ import logging
 import mimetypes
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException
-from supabase import create_client, Client
-from supabase.lib.client_options import ClientOptions
+from supabase import create_client, Client, ClientOptions
 import boto3
 from botocore.config import Config
 from tempfile import TemporaryDirectory
