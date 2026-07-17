@@ -1,9 +1,12 @@
 import os
 import subprocess
 import logging
+import mimetypes
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException
 from supabase import create_client, Client
+import boto3
+from botocore.config import Config
 from tempfile import TemporaryDirectory
 import shutil
 
@@ -21,15 +24,52 @@ app = FastAPI()
 async def root():
     return {"status": "Video Processor is Running"}
 
-# Supabase Setup
+# Supabase Setup (used for the "matches" database table only)
 URL = os.environ.get("SUPABASE_URL")
 KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-BUCKET = "competition_matches"
 
 if not URL or not KEY:
     logger.error("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables are missing!")
 
 supabase: Client = create_client(URL, KEY)
+
+# Cloudflare R2 Setup (video/thumbnail/HLS storage)
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
+# Public base URL the bucket is served from: either a custom domain
+# connected to the bucket, or the bucket's r2.dev URL.
+R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL")
+# Optional "folder" inside the bucket to upload into, e.g. "videos" or
+# "matches/2026". R2 has no real folders -- this is just a key prefix.
+R2_KEY_PREFIX = os.environ.get("R2_KEY_PREFIX", "competition_matches").strip("/")
+
+if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, R2_PUBLIC_URL]):
+    logger.error("One or more R2_* environment variables are missing!")
+
+r2 = boto3.client(
+    "s3",
+    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    config=Config(signature_version="s3v4"),
+    region_name="auto",
+)
+
+HLS_CONTENT_TYPES = {".m3u8": "application/vnd.apple.mpegurl", ".ts": "video/mp2t"}
+
+def build_r2_key(*parts: str) -> str:
+    segments = [p.strip("/") for p in parts if p]
+    if R2_KEY_PREFIX:
+        segments = [R2_KEY_PREFIX] + segments
+    return "/".join(segments)
+
+def upload_to_r2(local_path: str, key: str) -> str:
+    ext = os.path.splitext(local_path)[1].lower()
+    content_type = HLS_CONTENT_TYPES.get(ext) or mimetypes.guess_type(local_path)[0] or "application/octet-stream"
+    r2.upload_file(local_path, R2_BUCKET_NAME, key, ExtraArgs={"ContentType": content_type})
+    return f"{R2_PUBLIC_URL.rstrip('/')}/{key}"
 
 def process_video_task(temp_video_path: str, match_id: int, match_name: str, has_manual_thumb: bool, manual_thumb_path: str = None):
     logger.info(f"--- Starting Processing for Match ID: {match_id} ({match_name}) ---")
@@ -44,13 +84,7 @@ def process_video_task(temp_video_path: str, match_id: int, match_name: str, has
             thumb_url = None
             if has_manual_thumb and manual_thumb_path and os.path.exists(manual_thumb_path):
                 logger.info("Using manual thumbnail provided by user.")
-                with open(manual_thumb_path, 'rb') as f:
-                    supabase.storage.from_(BUCKET).upload(
-                        path=f"{match_name}/thumbnail.jpg",
-                        file=f,
-                        file_options={"upsert": "true"}
-                    )
-                thumb_url = supabase.storage.from_(BUCKET).get_public_url(f"{match_name}/thumbnail.jpg")
+                thumb_url = upload_to_r2(manual_thumb_path, build_r2_key(match_name, "thumbnail.jpg"))
             else:
                 # Auto-generated thumbnail extraction is independent of the HLS
                 # encode below (both only read the source file), so it runs on
@@ -95,13 +129,7 @@ def process_video_task(temp_video_path: str, match_id: int, match_name: str, has
                 thumb_executor.shutdown(wait=True)
 
                 if thumb_result.returncode == 0:
-                    with open(thumb_local, 'rb') as f:
-                        supabase.storage.from_(BUCKET).upload(
-                            path=f"{match_name}/thumbnail.jpg",
-                            file=f,
-                            file_options={"upsert": "true"}
-                        )
-                    thumb_url = supabase.storage.from_(BUCKET).get_public_url(f"{match_name}/thumbnail.jpg")
+                    thumb_url = upload_to_r2(thumb_local, build_r2_key(match_name, "thumbnail.jpg"))
                     logger.info("Auto-generated thumbnail uploaded successfully.")
                 else:
                     logger.error(f"FFmpeg thumbnail failed: {thumb_result.stderr}")
@@ -111,15 +139,10 @@ def process_video_task(temp_video_path: str, match_id: int, match_name: str, has
                 logger.info(f"Updating DB with thumbnail for Match {match_id}...")
                 supabase.table("matches").update({"thumbnail": thumb_url}).eq("id", match_id).execute()
 
-            # 3. Upload ABR files to Supabase concurrently
+            # 3. Upload ABR files to R2 concurrently
             def upload_segment(file_name: str):
                 file_path = os.path.join(abr_dir, file_name)
-                with open(file_path, 'rb') as f:
-                    supabase.storage.from_(BUCKET).upload(
-                        path=f"{match_name}/abr/{file_name}",
-                        file=f,
-                        file_options={"upsert": "true"}
-                    )
+                upload_to_r2(file_path, build_r2_key(match_name, "abr", file_name))
                 return file_name
 
             abr_files = os.listdir(abr_dir)
@@ -140,7 +163,7 @@ def process_video_task(temp_video_path: str, match_id: int, match_name: str, has
             logger.info(f"All {len(abr_files)} HLS files uploaded.")
 
             # 4. Update Database
-            video_url = supabase.storage.from_(BUCKET).get_public_url(f"{match_name}/abr/master.m3u8")
+            video_url = f"{R2_PUBLIC_URL.rstrip('/')}/{build_r2_key(match_name, 'abr', 'master.m3u8')}"
             
             update_data = {
                 "video_url": video_url,
