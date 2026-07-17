@@ -5,6 +5,7 @@ import mimetypes
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException
 from supabase import create_client, Client
+from supabase.lib.client_options import ClientOptions
 import boto3
 from botocore.config import Config
 from tempfile import TemporaryDirectory
@@ -31,7 +32,8 @@ KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 if not URL or not KEY:
     logger.error("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables are missing!")
 
-supabase: Client = create_client(URL, KEY)
+# The "matches" table lives in the "website" schema, not "public".
+supabase: Client = create_client(URL, KEY, options=ClientOptions(schema="website"))
 
 # Cloudflare R2 Setup (video/thumbnail/HLS storage)
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
@@ -45,7 +47,8 @@ R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL")
 # "matches/2026". R2 has no real folders -- this is just a key prefix.
 R2_KEY_PREFIX = os.environ.get("R2_KEY_PREFIX", "competition_matches").strip("/")
 
-if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, R2_PUBLIC_URL]):
+R2_CONFIGURED = all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, R2_PUBLIC_URL])
+if not R2_CONFIGURED:
     logger.error("One or more R2_* environment variables are missing!")
 
 r2 = boto3.client(
@@ -66,6 +69,11 @@ def build_r2_key(*parts: str) -> str:
     return "/".join(segments)
 
 def upload_to_r2(local_path: str, key: str) -> str:
+    if not R2_CONFIGURED:
+        raise RuntimeError(
+            "Cloudflare R2 is not configured: set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, "
+            "R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, and R2_PUBLIC_URL."
+        )
     ext = os.path.splitext(local_path)[1].lower()
     content_type = HLS_CONTENT_TYPES.get(ext) or mimetypes.guess_type(local_path)[0] or "application/octet-stream"
     r2.upload_file(local_path, R2_BUCKET_NAME, key, ExtraArgs={"ContentType": content_type})
