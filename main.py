@@ -176,8 +176,11 @@ def process_video_task(temp_video_path: str, match_id: int, match_name: str, has
             logger.info(f"--- Success! Match {match_id} is now LIVE ---")
 
         except Exception as e:
-            logger.error(f"CRITICAL ERROR processing match {match_id}: {str(e)}")
-            supabase.table("matches").update({"is_processing": False}).eq("id", match_id).execute()
+            logger.exception(f"CRITICAL ERROR processing match {match_id}: {str(e)}")
+            try:
+                supabase.table("matches").update({"is_processing": False}).eq("id", match_id).execute()
+            except Exception:
+                logger.exception(f"Also failed to reset is_processing flag for match {match_id}")
         finally:
             # Cleanup the temporary uploaded video file
             if os.path.exists(temp_video_path):
